@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Corner Anamorphic Screen Rig",
-    "version": (1, 0, 1),
+    "version": (1, 7, 0),
     "blender": (4, 2, 0),
-    "author": "Raq-Auphelion",
+    "author": "Raq-Aphelion",
     "location": "View3D > Sidebar > Corner Anamorphic",
     "description": "Builds and renders a two-screen 90-degree anamorphic corner installation from one viewer camera.",
     "category": "3D View",
@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 import math
 import os
+import re
 import mathutils
 from mathutils import Vector
 
@@ -54,6 +55,7 @@ CA_PROGRESS = {
     "phase": "",
     "done": 0,
     "total": 0,
+    "stats": "",
     "message": "Idle"
 }
 
@@ -64,6 +66,7 @@ def progress_begin(phase, total):
         phase=phase,
         done=0,
         total=max(1, total),
+        stats="",
         message=""
     )
 
@@ -73,28 +76,204 @@ def progress_finish(message):
         active=False,
         message=message
     )
+    tag_ui_redraw()
+
+
+def tag_ui_redraw():
+    """
+    Repaint every area so the panel's progress display follows
+    the render handlers while a modal render is running.
+    """
+
+    wm = bpy.context.window_manager
+
+    if wm is None:
+        return
+
+    for window in wm.windows:
+
+        if window.screen is None:
+            continue
+
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+
+# ============================================================================
+# Async render jobs
+# ============================================================================
+#
+# Renders are started with INVOKE_DEFAULT so Blender shows its render
+# window with the progress bar and the UI stays responsive.  That call
+# returns immediately, so the work that depends on a finished render
+# (restoring the crop border, loading the master frames, restoring the
+# user's scene) runs as queued steps driven by a timer, gated on the
+# render_complete / render_cancel handlers.
+
+CA_JOB = {
+    "steps": [],
+    "in_flight": False,
+    "cancelled": False,
+    "after_render": None,
+    "cleanup": None
+}
+
+
+def job_running():
+    return bool(CA_JOB["steps"]) or CA_JOB["in_flight"]
+
+
+def run_after_render():
+    fn = CA_JOB["after_render"]
+    CA_JOB["after_render"] = None
+
+    if fn is not None:
+
+        try:
+            fn()
+        except Exception:
+            pass
+
+
+def start_render(after_render=None, **kwargs):
+    """
+    Start a non-blocking render.  after_render runs when the render
+    completes OR is cancelled (crop border restore, output setting
+    restore).
+    """
+
+    CA_JOB["in_flight"] = True
+    CA_JOB["after_render"] = after_render
+
+    try:
+        bpy.ops.render.render('INVOKE_DEFAULT', **kwargs)
+
+    except Exception:
+        CA_JOB["in_flight"] = False
+        run_after_render()
+        raise
+
+
+def start_job(steps, cleanup=None):
+    CA_JOB["steps"] = list(steps)
+    CA_JOB["cancelled"] = False
+    CA_JOB["cleanup"] = cleanup
+
+    bpy.app.timers.register(
+        ca_job_timer,
+        first_interval=0.1
+    )
+
+
+def finish_job(message):
+    CA_JOB["steps"] = []
+    CA_JOB["cancelled"] = False
+
+    cleanup = CA_JOB["cleanup"]
+    CA_JOB["cleanup"] = None
+
+    if cleanup is not None:
+
+        try:
+            cleanup()
+        except Exception:
+            pass
+
+    progress_finish(message)
+
+
+def ca_job_timer():
+
+    if CA_JOB["in_flight"]:
+        return 0.1
+
+    if CA_JOB["cancelled"]:
+        finish_job("Cancelled.")
+        return None
+
+    if not CA_JOB["steps"]:
+        return None
+
+    step = CA_JOB["steps"].pop(0)
+
+    try:
+        step()
+
+    except Exception as exc:
+        print(f"Corner Anamorphic render job failed: {exc}")
+        finish_job(f"Failed: {exc}")
+        return None
+
+    return 0.1
 
 
 @persistent
 def ca_render_pre(scene):
     CA_PROGRESS["active"] = True
+    CA_PROGRESS["stats"] = ""
+    tag_ui_redraw()
 
 
 @persistent
 def ca_render_post(scene):
     if CA_PROGRESS["active"]:
         CA_PROGRESS["done"] += 1
+    tag_ui_redraw()
 
 
 @persistent
 def ca_render_complete(scene):
     CA_PROGRESS["active"] = False
+    CA_JOB["in_flight"] = False
+    run_after_render()
+    tag_ui_redraw()
 
 
 @persistent
 def ca_render_cancel(scene):
     CA_PROGRESS["active"] = False
     CA_PROGRESS["message"] = "Cancelled."
+    CA_JOB["in_flight"] = False
+    CA_JOB["cancelled"] = True
+    run_after_render()
+    tag_ui_redraw()
+
+
+@persistent
+def ca_render_stats(*args):
+    """
+    Track the current frame's own progress (e.g. 'Rendering
+    25 / 64 samples') so the panel can mirror the per-frame
+    percentage shown in Blender's status bar instead of the
+    whole-animation fraction.
+    """
+
+    if args and isinstance(args[0], str):
+        CA_PROGRESS["stats"] = args[0]
+        tag_ui_redraw()
+
+
+def frame_progress_fraction():
+    """
+    Progress of the frame currently being rendered, parsed from
+    the render statistics, or None when no statistics have come
+    in yet.
+    """
+
+    matches = re.findall(
+        r"(\d+)\s*/\s*(\d+)",
+        CA_PROGRESS["stats"]
+    )
+
+    if not matches:
+        return None
+
+    done, total = (int(v) for v in matches[-1])
+
+    if total <= 0:
+        return None
+
+    return done / total
 
 
 CA_PROGRESS_HANDLERS = (
@@ -102,6 +281,7 @@ CA_PROGRESS_HANDLERS = (
     (bpy.app.handlers.render_post, ca_render_post),
     (bpy.app.handlers.render_complete, ca_render_complete),
     (bpy.app.handlers.render_cancel, ca_render_cancel),
+    (bpy.app.handlers.render_stats, ca_render_stats),
 )
 
 
@@ -162,6 +342,55 @@ def update_scene_graph(scene):
 
     for view_layer in scene.view_layers:
         view_layer.update()
+
+
+def ffmpeg_available():
+    """
+    True when this Blender build can write video files.  The
+    Microsoft Store package ships without FFmpeg, so MP4 output
+    can never work there.
+    """
+
+    probe = bpy.data.scenes.new("CA_FFMPEG_PROBE")
+
+    try:
+
+        settings = probe.render.image_settings
+
+        if hasattr(settings, "media_type"):
+            settings.media_type = 'VIDEO'
+
+        settings.file_format = 'FFMPEG'
+
+        return True
+
+    except (TypeError, AttributeError):
+        return False
+
+    finally:
+        bpy.data.scenes.remove(probe)
+
+
+def show_ffmpeg_warning_popup():
+    """
+    Deferred probe + popup, run via a timer.  Registration itself
+    must not touch bpy.data (it is restricted while the extension
+    installer enables the add-on), so both the FFmpeg check and
+    the popup live here, where the context is unrestricted again.
+    """
+
+    try:
+
+        if not ffmpeg_available():
+            bpy.ops.corner_anamorphic.ffmpeg_warning(
+                'INVOKE_DEFAULT'
+            )
+
+    except Exception:
+        pass
+
+    # Returning None unregisters the timer.
+    return None
 
 
 # ============================================================================
@@ -341,9 +570,52 @@ def camera_focus_target(settings):
         0.0,
         0.0,
         settings.screen_z
-        + settings.screen_height * 0.5
+        + max(
+            settings.left_height,
+            settings.right_height
+        ) * 0.5
         + settings.focus_offset
     ))
+
+
+def camera_plan_azimuth(settings):
+    """
+    Plan-view azimuth of the master camera along its arc around the
+    corner.  The viewer angle maps onto the corner angle: 0 degrees
+    aligns the camera with the RIGHT screen's plane, 90 degrees with
+    the LEFT screen's plane, and 45 degrees (the default) centers it
+    on the exterior angle bisector.
+    """
+
+    angle = max(
+        math.radians(1.0),
+        min(
+            math.radians(179.0),
+            settings.corner_angle
+        )
+    )
+
+    return angle * (
+        settings.viewer_angle / math.radians(90.0)
+    )
+
+
+def place_camera(cam, settings):
+    """
+    Put the master camera on its arc at the configured distance and
+    eye height, aimed at the screens' focus point.
+    """
+
+    azimuth = camera_plan_azimuth(settings)
+    distance = max(0.001, settings.viewer_distance)
+
+    cam.location = (
+        -math.cos(azimuth) * distance,
+        -math.sin(azimuth) * distance,
+        settings.eye_height
+    )
+
+    look_at(cam, camera_focus_target(settings))
 
 
 def configure_camera(cam, settings):
@@ -407,7 +679,7 @@ def setup_screen_uv(screen):
     uv.active_render = True
 
 
-def setup_uv_project(screen, cam, settings):
+def setup_uv_project(screen, cam, width, height):
     """
     Tie the screen's UV layer to a UVProject modifier driven by the
     master camera, so the projection always follows the camera live.
@@ -430,10 +702,7 @@ def setup_uv_project(screen, cam, settings):
         )
 
     mod.uv_layer = UV_PROJECTED
-    mod.aspect_x = (
-        settings.screen_width
-        / max(0.001, settings.screen_height)
-    )
+    mod.aspect_x = width / max(0.001, height)
     mod.aspect_y = 1.0
     mod.projector_count = 1
     mod.projectors[0].object = cam
@@ -487,14 +756,19 @@ def update_rig(scene):
         'Z'
     )
 
-    z_offset = (
+    z_offset_right = (
         s.screen_z
-        + s.screen_height / 2.0
+        + s.right_height / 2.0
+    )
+
+    z_offset_left = (
+        s.screen_z
+        + s.left_height / 2.0
     )
 
     right_m = (
         mathutils.Matrix.Translation(
-            (0.0, 0.0, z_offset)
+            (0.0, 0.0, z_offset_right)
         )
         @ rz_right
         @ rx
@@ -502,34 +776,32 @@ def update_rig(scene):
 
     left_m = (
         mathutils.Matrix.Translation(
-            (0.0, 0.0, z_offset)
+            (0.0, 0.0, z_offset_left)
         )
         @ rz_left
         @ rx
     )
 
-    x_offset = s.screen_width / 2.0
-
     right = make_grid(
         OBJ_RIGHT,
-        s.screen_width,
-        s.screen_height,
+        s.right_width,
+        s.right_height,
         s.screen_subdivisions,
         s.screen_subdivisions,
         right_m,
         coll,
-        x_offset=x_offset
+        x_offset=s.right_width / 2.0
     )
 
     left = make_grid(
         OBJ_LEFT,
-        s.screen_width,
-        s.screen_height,
+        s.left_width,
+        s.left_height,
         s.screen_subdivisions,
         s.screen_subdivisions,
         left_m,
         coll,
-        x_offset=x_offset
+        x_offset=s.left_width / 2.0
     )
 
     ensure_screen_material(left)
@@ -547,18 +819,9 @@ def update_rig(scene):
 
     cam = ensure_camera(OBJ_MASTER, coll)
 
-    half = angle * 0.5
-    distance = max(0.001, s.viewer_distance)
-
-    cam.location = (
-        -math.cos(half) * distance,
-        -math.sin(half) * distance,
-        s.eye_height
-    )
-
     # The camera always points at the screens: a focus point on the
     # corner edge where they meet (bottom / center / top).
-    look_at(cam, camera_focus_target(s))
+    place_camera(cam, s)
 
     configure_camera(cam, s)
 
@@ -568,9 +831,21 @@ def update_rig(scene):
     # Screen UVs and camera-driven projection
     # ------------------------------------------------------------------------
 
-    for screen in (left, right):
-        setup_screen_uv(screen)
-        setup_uv_project(screen, cam, s)
+    setup_screen_uv(left)
+    setup_uv_project(
+        left,
+        cam,
+        s.left_width,
+        s.left_height
+    )
+
+    setup_screen_uv(right)
+    setup_uv_project(
+        right,
+        cam,
+        s.right_width,
+        s.right_height
+    )
 
     # Refresh the texture reference in case the master image exists.
     tex = get_master_texture_node()
@@ -637,6 +912,13 @@ def build_output_scene(source_scene, side):
         else s.right_screen_name
     ]
 
+    if side == "LEFT":
+        width = s.left_width
+        height = s.left_height
+    else:
+        width = s.right_width
+        height = s.right_height
+
     out.collection.objects.link(screen)
 
     # Orthographic camera, straight-on from the viewer side.
@@ -650,12 +932,22 @@ def build_output_scene(source_scene, side):
 
     out.collection.objects.link(cam)
 
-    center = screen.matrix_world.translation
+    # The screen mesh starts at the corner edge (local X runs from
+    # 0 to the screen width), so the object origin is NOT the
+    # screen center - take the center of the mesh bounds instead.
+    xs = [c[0] for c in screen.bound_box]
+    ys = [c[1] for c in screen.bound_box]
+
+    center = screen.matrix_world @ Vector((
+        (min(xs) + max(xs)) * 0.5,
+        (min(ys) + max(ys)) * 0.5,
+        0.0
+    ))
 
     normal = (
         screen.matrix_world.to_3x3()
         @ Vector((0.0, 0.0, 1.0))
-    )
+    ).normalized()
 
     master_cam = bpy.data.objects[s.master_camera_name]
 
@@ -664,35 +956,41 @@ def build_output_scene(source_scene, side):
 
     cam.location = (
         center
-        + normal * max(
-            s.screen_width,
-            s.screen_height
-        ) * 2.0
+        + normal * max(width, height) * 2.0
     )
 
-    look_at(cam, center)
+    # Aim the camera straight at the screen with the capture's "up"
+    # matching world up, so it matches the physical display as the
+    # outside viewer sees it.  look_at() cannot be used here: the
+    # view direction is horizontal, parallel to its up hint.
+    x_axis = Vector((0.0, 0.0, 1.0)).cross(normal).normalized()
+    y_axis = normal.cross(x_axis)
+
+    cam.matrix_world = mathutils.Matrix((
+        (x_axis.x, y_axis.x, normal.x, cam.location.x),
+        (x_axis.y, y_axis.y, normal.y, cam.location.y),
+        (x_axis.z, y_axis.z, normal.z, cam.location.z),
+        (0.0, 0.0, 0.0, 1.0)
+    ))
 
     # Render aspect always matches the screen aspect (resolutions are
     # tied to the screen size), so the larger dimension is what the
     # ortho scale has to cover.
-    cam_data.ortho_scale = max(
-        s.screen_width,
-        s.screen_height
-    )
+    cam_data.ortho_scale = max(width, height)
 
     out.camera = cam
 
     out.render.resolution_x = max(
         4,
         int(round(
-            s.screen_width
+            width
             * s.resolution_multiplier
         ))
     )
     out.render.resolution_y = max(
         4,
         int(round(
-            s.screen_height
+            height
             * s.resolution_multiplier
         ))
     )
@@ -793,17 +1091,24 @@ def build_combined_capture(source_scene):
     if old:
         bpy.data.objects.remove(old, do_unlink=True)
 
-    W = s.screen_width
-    H = s.screen_height
+    W_left = s.left_width
+    H_left = s.left_height
+    W_right = s.right_width
+    H_right = s.right_height
     n = max(1, int(s.screen_subdivisions))
 
     verts = []
     faces = []
     vert_uvs = []
 
-    for quad_index, side in enumerate(
-        ("LEFT", "RIGHT")
-    ):
+    for side in ("LEFT", "RIGHT"):
+
+        if side == "LEFT":
+            W = W_left
+            H = H_left
+        else:
+            W = W_right
+            H = H_right
 
         screen = bpy.data.objects[
             s.left_screen_name
@@ -827,7 +1132,11 @@ def build_combined_capture(source_scene):
             for i in range(n + 1):
 
                 u = i / n
-                x = (quad_index + u - 1.0) * W
+
+                if side == "LEFT":
+                    x = (u - 1.0) * W_left
+                else:
+                    x = u * W_right
 
                 # The screens are planar rectangles, so bilinear
                 # interpolation between their corners lands exactly
@@ -915,27 +1224,31 @@ def build_combined_scene(source_scene):
 
     out.collection.objects.link(cam)
 
-    W = s.screen_width
-    H = s.screen_height
+    W_total = s.left_width + s.right_width
+    H = max(s.left_height, s.right_height)
 
-    center = Vector((0.0, H * 0.5, 0.0))
+    center = Vector((
+        (s.right_width - s.left_width) * 0.5,
+        H * 0.5,
+        0.0
+    ))
 
     cam.location = center + Vector((
         0.0,
         0.0,
-        max(2.0 * W, H) * 2.0
+        max(W_total, H) * 2.0
     ))
 
     look_at(cam, center)
 
-    cam_data.ortho_scale = max(2.0 * W, H)
+    cam_data.ortho_scale = max(W_total, H)
 
     out.camera = cam
 
     out.render.resolution_x = max(
         4,
         int(round(
-            2.0 * W
+            W_total
             * s.resolution_multiplier
         ))
     )
@@ -981,6 +1294,112 @@ def resolve_output_dir(s):
     return bpy.path.abspath(s.output_directory)
 
 
+def latest_feed_output(s):
+    """
+    Directory of the most recently written screen-feed render
+    (a *_frames directory or the output directory containing a
+    feed video), or None when no feeds have been rendered yet.
+    """
+
+    try:
+        output_dir = resolve_output_dir(s)
+    except RuntimeError:
+        return None
+
+    if not os.path.isdir(output_dir):
+        return None
+
+    newest_dir = None
+    newest_mtime = -1.0
+
+    def consider(path, is_dir):
+        nonlocal newest_dir, newest_mtime
+
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+
+        if mtime > newest_mtime:
+            newest_mtime = mtime
+            newest_dir = (
+                path if is_dir else output_dir
+            )
+
+    for base in (
+        s.left_filename,
+        s.right_filename,
+        s.combined_filename
+    ):
+
+        base = os.path.splitext(base)[0]
+
+        frames_dir = os.path.join(
+            output_dir,
+            base + "_frames"
+        )
+
+        if (
+            os.path.isdir(frames_dir)
+            and os.listdir(frames_dir)
+        ):
+            consider(frames_dir, True)
+
+        for name in os.listdir(output_dir):
+
+            if (
+                name.startswith(base)
+                and name.lower().endswith(
+                    VIDEO_FILE_EXTENSIONS
+                )
+            ):
+                consider(
+                    os.path.join(output_dir, name),
+                    False
+                )
+
+    return newest_dir
+
+
+VIDEO_CODECS = {
+    'MPEG4': 'H264',
+    'MKV': 'H264',
+    'QUICKTIME': 'H264',
+    'AVI': 'H264',
+    'WEBM': 'WEBM',
+    'MPEG1': 'MPEG1',
+    'MPEG2': 'MPEG2',
+    'OGG': 'THEORA',
+    'DV': 'DV'
+}
+
+VIDEO_FILE_EXTENSIONS = (
+    ".mp4", ".mkv", ".mov", ".avi", ".webm",
+    ".ogv", ".mpg", ".mpeg", ".dv"
+)
+
+
+def configure_video_format(render, video_format):
+    """
+    Point a render at video output in the given container,
+    picking a codec the container actually supports.
+    Blender 5.x gates video formats behind the media type;
+    on 4.x file_format accepts 'FFMPEG' directly.
+    """
+
+    image_settings = render.image_settings
+
+    if hasattr(image_settings, "media_type"):
+        image_settings.media_type = 'VIDEO'
+
+    image_settings.file_format = 'FFMPEG'
+    render.ffmpeg.format = video_format
+    render.ffmpeg.codec = VIDEO_CODECS.get(
+        video_format,
+        'H264'
+    )
+
+
 def configure_output_format(out, s, filename):
     """
     Set the output scene up for either MP4 or an image sequence, and
@@ -994,19 +1413,16 @@ def configure_output_format(out, s, filename):
     if s.output_mode == 'MP4':
 
         try:
-            out.render.image_settings.file_format = (
-                'FFMPEG'
+            configure_video_format(
+                out.render,
+                s.video_format
             )
-            out.render.ffmpeg.format = 'MPEG4'
-            out.render.ffmpeg.codec = 'H264'
 
         except (TypeError, AttributeError):
             raise RuntimeError(
-                "MP4 output requires FFmpeg, which this "
-                "Blender build does not include (the "
-                "Microsoft Store package).  Switch the "
-                "output mode to Image Sequence, or use a "
-                "Blender build from blender.org."
+                "Video output is not available in this "
+                "Blender build.  Switch the output mode "
+                "to Image Sequence instead."
             )
 
         out.render.filepath = os.path.join(
@@ -1016,7 +1432,12 @@ def configure_output_format(out, s, filename):
 
     else:
 
-        out.render.image_settings.file_format = (
+        image_settings = out.render.image_settings
+
+        if hasattr(image_settings, "media_type"):
+            image_settings.media_type = 'IMAGE'
+
+        image_settings.file_format = (
             s.image_format
         )
 
@@ -1039,9 +1460,127 @@ def configure_output_format(out, s, filename):
 # Master rendering
 # ============================================================================
 
+def apply_master_crop(scene):
+    """
+    Restrict the master render to the region of the frame the
+    screens actually cover, using Blender's render border.
+
+    Crop-to-border stays OFF: the output image keeps the full
+    master resolution (the area outside the border is simply not
+    rendered), so the projection UVs still line up with the
+    uncropped frame.  Only the pixels inside the border cost
+    render time.
+
+    Returns the previous border settings so they can be restored
+    (via restore_master_crop) once the render has ended.
+    """
+
+    render = scene.render
+
+    saved = {
+        "use_border": render.use_border,
+        "use_crop_to_border": render.use_crop_to_border,
+        "border_min_x": render.border_min_x,
+        "border_max_x": render.border_max_x,
+        "border_min_y": render.border_min_y,
+        "border_max_y": render.border_max_y
+    }
+
+    s = scene.corner_anamorphic
+
+    if not s.crop_master:
+        return saved
+
+    cam = bpy.data.objects.get(s.master_camera_name)
+
+    if cam is None:
+        return saved
+
+    update_scene_graph(scene)
+
+    xs = []
+    ys = []
+
+    for name in (s.left_screen_name, s.right_screen_name):
+
+        screen = bpy.data.objects.get(name)
+
+        if screen is None:
+            continue
+
+        for corner in screen.bound_box:
+
+            world = screen.matrix_world @ Vector(corner)
+
+            q = world_to_camera_view(scene, cam, world)
+
+            xs.append(q.x)
+            ys.append(q.y)
+
+    if not xs:
+        return saved
+
+    # The border is a fraction of the frame; convert the pixel
+    # margin against the actual render size.
+    scale = render.resolution_percentage / 100.0
+    res_x = max(1, int(render.resolution_x * scale))
+    res_y = max(1, int(render.resolution_y * scale))
+
+    margin_x = s.crop_margin / res_x
+    margin_y = s.crop_margin / res_y
+
+    min_x = max(0.0, min(xs) - margin_x)
+    max_x = min(1.0, max(xs) + margin_x)
+    min_y = max(0.0, min(ys) - margin_y)
+    max_y = min(1.0, max(ys) + margin_y)
+
+    # Screens entirely outside the camera frame - cropping to an
+    # empty border would break the render, so leave it alone.
+    if min_x >= max_x or min_y >= max_y:
+        return saved
+
+    render.use_border = True
+    render.use_crop_to_border = False
+    render.border_min_x = min_x
+    render.border_max_x = max_x
+    render.border_min_y = min_y
+    render.border_max_y = max_y
+
+    return saved
+
+
+def restore_master_crop(scene, saved):
+
+    render = scene.render
+
+    render.use_border = saved["use_border"]
+    render.use_crop_to_border = saved["use_crop_to_border"]
+    render.border_min_x = saved["border_min_x"]
+    render.border_max_x = saved["border_max_x"]
+    render.border_min_y = saved["border_min_y"]
+    render.border_max_y = saved["border_max_y"]
+
+
+def set_still_image_format(scene):
+    """
+    Point the scene's output at a still PNG.  Blender 5.x splits
+    image and video output behind image_settings.media_type, so a
+    scene left on video output rejects image formats outright.
+    """
+
+    image_settings = scene.render.image_settings
+
+    if hasattr(image_settings, "media_type"):
+        image_settings.media_type = 'IMAGE'
+
+    image_settings.file_format = 'PNG'
+
+
 def render_master_still(scene, filepath):
     """
-    Render one master frame with the screens hidden.
+    Start the render of one master frame with the screens hidden
+    (non-blocking - the crop border is restored by the render
+    complete/cancel handlers).
     """
 
     s = scene.corner_anamorphic
@@ -1053,14 +1592,53 @@ def render_master_still(scene, filepath):
     left.hide_render = True
     right.hide_render = True
 
-    scene.render.image_settings.file_format = 'PNG'
+    set_still_image_format(scene)
     scene.render.filepath = filepath
     scene.camera = cam
 
-    bpy.ops.render.render(
-        'INVOKE_DEFAULT',
+    saved = apply_master_crop(scene)
+
+    start_render(
+        after_render=lambda: restore_master_crop(scene, saved),
         write_still=True
     )
+
+
+def refresh_screen_previews():
+    """
+    Force viewports in Material Preview / Rendered shading to pick
+    up a newly loaded master image.  Without the update tags the
+    GPU texture cache keeps showing the previous master until the
+    shading mode is switched away and back.
+    """
+
+    mat = bpy.data.materials.get(MAT_PROJECTION)
+
+    if mat is not None:
+        mat.update_tag()
+
+    for name in (OBJ_LEFT, OBJ_RIGHT, OBJ_COMBINED):
+        obj = bpy.data.objects.get(name)
+
+        if obj is not None:
+            obj.update_tag()
+
+    wm = bpy.context.window_manager
+
+    if wm is None:
+        return
+
+    for window in wm.windows:
+
+        screen = window.screen
+
+        if screen is None:
+            continue
+
+        for area in screen.areas:
+
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
 
 def load_master_image(filepath):
@@ -1090,6 +1668,8 @@ def load_master_image(filepath):
 
     if tex is not None:
         tex.image = img
+
+    refresh_screen_previews()
 
     return img
 
@@ -1136,7 +1716,61 @@ def load_master_sequence(frames_dir, first, last):
         user.use_cyclic = False
         user.use_auto_refresh = True
 
+    refresh_screen_previews()
+
     return seq
+
+
+def load_master_video(video_dir, first, last):
+    """
+    Point the projection material at the rendered master video.
+    Playback settings live on the texture node's image user, the
+    same as for image sequences.
+    """
+
+    video_path = None
+
+    if os.path.isdir(video_dir):
+
+        for name in sorted(os.listdir(video_dir)):
+
+            if name.lower().endswith(VIDEO_FILE_EXTENSIONS):
+                video_path = os.path.join(video_dir, name)
+                break
+
+    if video_path is None:
+        raise RuntimeError(
+            "Master video was not written to "
+            f"'{video_dir}'."
+        )
+
+    old = bpy.data.images.get(IMG_MASTER_SEQ)
+
+    if old:
+        bpy.data.images.remove(old)
+
+    movie = bpy.data.images.load(
+        video_path,
+        check_existing=False
+    )
+    movie.name = IMG_MASTER_SEQ
+    movie.source = 'MOVIE'
+
+    tex = get_master_texture_node()
+
+    if tex is not None:
+        tex.image = movie
+
+        user = tex.image_user
+        user.frame_start = first
+        user.frame_duration = last - first + 1
+        user.frame_offset = 0
+        user.use_cyclic = False
+        user.use_auto_refresh = True
+
+    refresh_screen_previews()
+
+    return movie
 
 
 # ============================================================================
@@ -1184,39 +1818,171 @@ class CA_OT_build_rig(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-class CA_OT_update(bpy.types.Operator):
+class CA_OT_ffmpeg_warning(bpy.types.Operator):
 
-    bl_idname = "corner_anamorphic.update_rig"
-    bl_label = "Update Projection"
+    bl_idname = "corner_anamorphic.ffmpeg_warning"
+    bl_label = "Corner Anamorphic: MP4 Unavailable"
 
-    bl_description = (
-        "Apply the current settings "
-        "to the existing rig"
-    )
+    bl_options = {'REGISTER', 'INTERNAL'}
 
-    bl_options = {'REGISTER', 'UNDO'}
+    def invoke(self, context, event):
+
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=430
+        )
 
     def execute(self, context):
 
-        try:
+        return {'FINISHED'}
 
-            update_rig(context.scene)
+    def draw(self, context):
 
-            self.report(
-                {'INFO'},
-                "Corner anamorphic rig updated."
+        col = self.layout.column(align=True)
+        col.label(
+            text=(
+                "This looks like the Microsoft Store "
+                "version of Blender, which ships"
             )
+        )
+        col.label(
+            text="without video (FFmpeg) support."
+        )
 
-            return {'FINISHED'}
+        col.separator()
 
-        except Exception as exc:
+        col.label(
+            text=(
+                "MP4 output will not work - use "
+                "Image Sequence mode instead, or"
+            )
+        )
+        col.label(
+            text=(
+                "install Blender from blender.org "
+                "to enable MP4."
+            )
+        )
+
+
+class CA_OT_change_output_directory(bpy.types.Operator):
+
+    bl_idname = "corner_anamorphic.change_output_directory"
+    bl_label = "Change Directory..."
+
+    bl_description = (
+        "Choose where the renders are written "
+        "(defaults to //corner_anamorphic/ next to "
+        "the .blend file)"
+    )
+
+    bl_options = {'REGISTER'}
+
+    directory: bpy.props.StringProperty(
+        subtype='DIR_PATH'
+    )
+
+    filter_folder: bpy.props.BoolProperty(
+        default=True,
+        options={'HIDDEN'}
+    )
+
+    def invoke(self, context, event):
+
+        try:
+            self.directory = bpy.path.abspath(
+                context.scene.corner_anamorphic
+                .output_directory
+            )
+        except Exception:
+            pass
+
+        context.window_manager.fileselect_add(self)
+
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+
+        context.scene.corner_anamorphic.output_directory = (
+            self.directory
+        )
+
+        return {'FINISHED'}
+
+
+class CA_OT_open_output_directory(bpy.types.Operator):
+
+    bl_idname = "corner_anamorphic.open_output_directory"
+    bl_label = "Open Output Directory"
+
+    bl_description = (
+        "Open the output directory in the "
+        "system file browser"
+    )
+
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+
+        s = context.scene.corner_anamorphic
+
+        try:
+            output_dir = resolve_output_dir(s)
+
+        except RuntimeError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        bpy.ops.wm.path_open(filepath=output_dir)
+
+        return {'FINISHED'}
+
+
+class CA_OT_open_render_directory(bpy.types.Operator):
+
+    bl_idname = "corner_anamorphic.open_render_directory"
+    bl_label = "Open Render Directory"
+
+    bl_description = (
+        "Open the directory of the most recent "
+        "screen animation render in the system "
+        "file browser"
+    )
+
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+
+        scene = context.scene
+
+        return (
+            scene is not None
+            and latest_feed_output(
+                scene.corner_anamorphic
+            ) is not None
+        )
+
+    def execute(self, context):
+
+        target = latest_feed_output(
+            context.scene.corner_anamorphic
+        )
+
+        if target is None:
 
             self.report(
-                {'ERROR'},
-                f"Update failed: {exc}"
+                {'WARNING'},
+                "No screen animation renders found."
             )
 
             return {'CANCELLED'}
+
+        bpy.ops.wm.path_open(filepath=target)
+
+        return {'FINISHED'}
 
 
 class CA_OT_delete_rig(bpy.types.Operator):
@@ -1332,6 +2098,15 @@ class CA_OT_render_master(bpy.types.Operator):
 
     def execute(self, context):
 
+        if job_running():
+
+            self.report(
+                {'WARNING'},
+                "A render job is already running."
+            )
+
+            return {'CANCELLED'}
+
         scene = context.scene
         s = scene.corner_anamorphic
 
@@ -1348,23 +2123,7 @@ class CA_OT_render_master(bpy.types.Operator):
                 "CA_MASTER_FRAME.png"
             )
 
-            progress_begin("Master frame", 1)
-
-            render_master_still(scene, path)
-            load_master_image(path)
-
-            progress_finish("Master frame rendered.")
-
-            self.report(
-                {'INFO'},
-                f"Master frame rendered: {path}"
-            )
-
-            return {'FINISHED'}
-
         except Exception as exc:
-
-            progress_finish("Master render failed.")
 
             self.report(
                 {'ERROR'},
@@ -1373,30 +2132,37 @@ class CA_OT_render_master(bpy.types.Operator):
 
             return {'CANCELLED'}
 
+        def step_render():
+            progress_begin("Master frame", 1)
+            render_master_still(scene, path)
 
-def master_animation_present(scene):
-    """
-    True when master frames for the scene's current frame range
-    exist on disk (the first and last frame are checked).
-    """
+        def step_load():
+            load_master_image(path)
+            progress_finish(
+                f"Master frame rendered: {path}"
+            )
 
-    s = scene.corner_anamorphic
+        start_job([step_render, step_load])
 
-    try:
-        frames_dir = os.path.join(
-            resolve_output_dir(s),
-            "master_frames"
+        self.report(
+            {'INFO'},
+            "Rendering master frame..."
         )
-    except RuntimeError:
-        return False
+
+        return {'FINISHED'}
+
+
+def master_sequence_present(output_dir, first, last):
 
     first_path = os.path.join(
-        frames_dir,
-        f"master_{scene.frame_start:04d}.png"
+        output_dir,
+        "master_frames",
+        f"master_{first:04d}.png"
     )
     last_path = os.path.join(
-        frames_dir,
-        f"master_{scene.frame_end:04d}.png"
+        output_dir,
+        "master_frames",
+        f"master_{last:04d}.png"
     )
 
     return (
@@ -1405,21 +2171,163 @@ def master_animation_present(scene):
     )
 
 
-def render_master_frames(source, context):
+def master_video_present(output_dir):
+
+    video_dir = os.path.join(
+        output_dir,
+        "master_video"
+    )
+
+    return os.path.isdir(video_dir) and any(
+        name.lower().endswith(VIDEO_FILE_EXTENSIONS)
+        for name in os.listdir(video_dir)
+    )
+
+
+def master_animation_present(scene):
     """
-    Render the master camera for the scene frame range into
-    <output>/master_frames/ and load the sequence into the
-    projection material.
+    True when a master animation exists on disk - either the
+    image sequence (first and last frame of the scene's current
+    frame range are checked) or the video, so the screen feeds
+    can be rendered in either format regardless of how the
+    master was rendered.
     """
 
-    s = source.corner_anamorphic
+    s = scene.corner_anamorphic
+
+    try:
+        output_dir = resolve_output_dir(s)
+    except RuntimeError:
+        return False
+
+    return (
+        master_sequence_present(
+            output_dir,
+            scene.frame_start,
+            scene.frame_end
+        )
+        or master_video_present(output_dir)
+    )
+
+
+def render_master_sequence(source, output_dir):
+    """
+    Start rendering the master camera as PNG frames into
+    <output>/master_frames/ (non-blocking - the crop border is
+    restored by the render complete/cancel handlers).
+    """
 
     frames_dir = os.path.join(
-        resolve_output_dir(s),
+        output_dir,
         "master_frames"
     )
 
     os.makedirs(frames_dir, exist_ok=True)
+
+    set_still_image_format(source)
+
+    source.render.filepath = os.path.join(
+        frames_dir,
+        "master_"
+    )
+
+    saved = apply_master_crop(source)
+
+    start_render(
+        after_render=lambda: restore_master_crop(source, saved),
+        animation=True
+    )
+
+
+def render_master_video(source, output_dir):
+    """
+    Start rendering the master camera as a single video file
+    into <output>/master_video/ (non-blocking).  The user's own
+    output settings and the crop border are restored by the
+    render complete/cancel handlers.
+    """
+
+    s = source.corner_anamorphic
+
+    render = source.render
+    image_settings = render.image_settings
+
+    saved_settings = {
+        "media_type": getattr(
+            image_settings,
+            "media_type",
+            None
+        ),
+        "file_format": image_settings.file_format,
+        "ffmpeg_format": render.ffmpeg.format,
+        "ffmpeg_codec": render.ffmpeg.codec,
+        "filepath": render.filepath
+    }
+
+    def restore_output_settings():
+
+        if saved_settings["media_type"] is not None:
+            image_settings.media_type = (
+                saved_settings["media_type"]
+            )
+
+        image_settings.file_format = (
+            saved_settings["file_format"]
+        )
+        render.ffmpeg.format = (
+            saved_settings["ffmpeg_format"]
+        )
+        render.ffmpeg.codec = (
+            saved_settings["ffmpeg_codec"]
+        )
+        render.filepath = saved_settings["filepath"]
+
+    video_dir = os.path.join(
+        output_dir,
+        "master_video"
+    )
+
+    os.makedirs(video_dir, exist_ok=True)
+
+    # Clear previous master videos so the fresh render is the
+    # only candidate when loading.
+    for name in os.listdir(video_dir):
+        os.remove(os.path.join(video_dir, name))
+
+    try:
+        configure_video_format(render, s.video_format)
+
+    except (TypeError, AttributeError):
+        restore_output_settings()
+        raise
+
+    render.filepath = os.path.join(
+        video_dir,
+        "master"
+    )
+
+    saved_crop = apply_master_crop(source)
+
+    def after_render():
+        restore_master_crop(source, saved_crop)
+        restore_output_settings()
+
+    start_render(
+        after_render=after_render,
+        animation=True
+    )
+
+
+def render_master_frames(source, window):
+    """
+    Start the master camera render for the scene frame range
+    (non-blocking), as PNG frames or as a video file following
+    the output mode.
+    """
+
+    s = source.corner_anamorphic
+
+    output_dir = resolve_output_dir(s)
 
     first = source.frame_start
     last = source.frame_end
@@ -1430,58 +2338,101 @@ def render_master_frames(source, context):
     left.hide_render = True
     right.hide_render = True
 
-    source.render.image_settings.file_format = 'PNG'
     source.camera = bpy.data.objects[
         s.master_camera_name
     ]
 
-    context.window.scene = source
+    window.scene = source
 
     progress_begin("Master frames", last - first + 1)
 
-    source.render.filepath = os.path.join(
-        frames_dir,
-        "master_"
-    )
-
-    bpy.ops.render.render(
-        'INVOKE_DEFAULT',
-        animation=True
-    )
-
-    load_master_sequence(frames_dir, first, last)
+    if s.output_mode == 'MP4':
+        render_master_video(source, output_dir)
+    else:
+        render_master_sequence(source, output_dir)
 
 
-def render_screen_feeds(source, context):
+def load_master_animation(scene):
     """
-    Render the screen feeds (separate L/R or the combined wide
-    frame) for the scene frame range.  The projection material
-    must already point at the master frames.
+    Feed the rendered master animation to the projection
+    material, preferring the format that matches the output
+    mode and falling back to whichever exists on disk - a
+    master rendered as video can drive image-sequence feeds
+    and the other way around.
     """
 
-    s = source.corner_anamorphic
+    s = scene.corner_anamorphic
+
+    output_dir = resolve_output_dir(s)
+
+    first = scene.frame_start
+    last = scene.frame_end
+
+    sequence_ok = master_sequence_present(
+        output_dir,
+        first,
+        last
+    )
+    video_ok = master_video_present(output_dir)
+
+    prefer_video = (
+        s.output_mode == 'MP4'
+        and video_ok
+    )
+
+    if prefer_video or (video_ok and not sequence_ok):
+
+        load_master_video(
+            os.path.join(output_dir, "master_video"),
+            first,
+            last
+        )
+
+    elif sequence_ok:
+
+        load_master_sequence(
+            os.path.join(output_dir, "master_frames"),
+            first,
+            last
+        )
+
+    else:
+        raise RuntimeError(
+            "No rendered master animation found - "
+            "render the master animation first."
+        )
+
+
+def screen_feed_steps(source, s, window):
+    """
+    Build the render steps for the screen feeds (separate L/R
+    or the combined wide frame).  The projection material must
+    already point at the master animation.
+    """
 
     first = source.frame_start
     last = source.frame_end
 
+    steps = []
+
     if s.render_layout == 'COMBINED':
 
-        out = build_combined_scene(source)
+        def step_combined():
+            out = build_combined_scene(source)
 
-        configure_output_format(
-            out,
-            s,
-            s.combined_filename
-        )
+            configure_output_format(
+                out,
+                s,
+                s.combined_filename
+            )
 
-        progress_begin("COMBINED", last - first + 1)
+            progress_begin("COMBINED", last - first + 1)
 
-        context.window.scene = out
+            window.scene = out
 
-        bpy.ops.render.render(
-            'INVOKE_DEFAULT',
-            animation=True
-        )
+            start_render(animation=True)
+
+        steps.append(step_combined)
 
     else:
 
@@ -1490,28 +2441,49 @@ def render_screen_feeds(source, context):
             ("RIGHT", s.right_filename)
         ):
 
-            screen = bpy.data.objects[
-                s.left_screen_name
-                if side == "LEFT"
-                else s.right_screen_name
-            ]
+            def make_steps(side=side, filename=filename):
 
-            out = build_output_scene(source, side)
+                screen_name = (
+                    s.left_screen_name
+                    if side == "LEFT"
+                    else s.right_screen_name
+                )
 
-            configure_output_format(out, s, filename)
+                def step_render():
+                    out = build_output_scene(source, side)
 
-            progress_begin(side, last - first + 1)
+                    configure_output_format(
+                        out,
+                        s,
+                        filename
+                    )
 
-            screen.hide_render = False
+                    progress_begin(
+                        side,
+                        last - first + 1
+                    )
 
-            context.window.scene = out
+                    bpy.data.objects[
+                        screen_name
+                    ].hide_render = False
 
-            bpy.ops.render.render(
-                'INVOKE_DEFAULT',
-                animation=True
-            )
+                    window.scene = out
 
-            screen.hide_render = True
+                    start_render(animation=True)
+
+                def step_hide():
+                    bpy.data.objects[
+                        screen_name
+                    ].hide_render = True
+
+                return step_render, step_hide
+
+            step_render, step_hide = make_steps()
+
+            steps.append(step_render)
+            steps.append(step_hide)
+
+    return steps
 
 
 class CA_OT_render_master_animation(bpy.types.Operator):
@@ -1528,35 +2500,26 @@ class CA_OT_render_master_animation(bpy.types.Operator):
 
     def execute(self, context):
 
+        if job_running():
+
+            self.report(
+                {'WARNING'},
+                "A render job is already running."
+            )
+
+            return {'CANCELLED'}
+
         source = context.scene
 
         original_frame = source.frame_current
-        original_scene = context.window.scene
 
         try:
-
             update_rig(source)
 
-            render_master_frames(source, context)
-
-            context.window.scene = original_scene
-            source.frame_set(original_frame)
-
-            progress_finish("Master animation rendered.")
-
-            self.report(
-                {'INFO'},
-                "Master animation rendered."
-            )
-
-            return {'FINISHED'}
+            # Fail early, before the job starts.
+            resolve_output_dir(source.corner_anamorphic)
 
         except Exception as exc:
-
-            context.window.scene = original_scene
-            source.frame_set(original_frame)
-
-            progress_finish("Master animation failed.")
 
             self.report(
                 {'ERROR'},
@@ -1565,6 +2528,29 @@ class CA_OT_render_master_animation(bpy.types.Operator):
 
             return {'CANCELLED'}
 
+        def step_render():
+            render_master_frames(source, context.window)
+
+        def step_load():
+            load_master_animation(source)
+            source.frame_set(original_frame)
+            progress_finish("Master animation rendered.")
+
+        def cleanup():
+            source.frame_set(original_frame)
+
+        start_job(
+            [step_render, step_load],
+            cleanup=cleanup
+        )
+
+        self.report(
+            {'INFO'},
+            "Rendering master animation..."
+        )
+
+        return {'FINISHED'}
+
 
 class CA_OT_delete_master_animation(bpy.types.Operator):
 
@@ -1572,8 +2558,8 @@ class CA_OT_delete_master_animation(bpy.types.Operator):
     bl_label = "Delete Master Animation"
 
     bl_description = (
-        "Delete the rendered master frames and unload "
-        "them from the screens"
+        "Delete the rendered master animation and "
+        "unload it from the screens"
     )
 
     bl_options = {'REGISTER'}
@@ -1595,38 +2581,41 @@ class CA_OT_delete_master_animation(bpy.types.Operator):
 
         try:
 
-            frames_dir = os.path.join(
-                resolve_output_dir(s),
-                "master_frames"
-            )
+            # Unload the master animation first: on Windows a
+            # loaded movie texture holds the video file open,
+            # which would make the deletion below fail.
+            tex = get_master_texture_node()
 
-            if os.path.isdir(frames_dir):
-
-                for name in os.listdir(frames_dir):
-
-                    if (
-                        name.startswith("master_")
-                        and name.endswith(".png")
-                    ):
-                        os.remove(
-                            os.path.join(frames_dir, name)
-                        )
-
-                try:
-                    os.rmdir(frames_dir)
-                except OSError:
-                    pass
+            if tex is not None:
+                tex.image = bpy.data.images.get(IMG_MASTER)
 
             seq = bpy.data.images.get(IMG_MASTER_SEQ)
 
             if seq:
                 bpy.data.images.remove(seq)
 
-            # Fall back to the still master on the screens.
-            tex = get_master_texture_node()
+            for sub_dir in (
+                "master_frames",
+                "master_video"
+            ):
 
-            if tex is not None:
-                tex.image = bpy.data.images.get(IMG_MASTER)
+                target_dir = os.path.join(
+                    resolve_output_dir(s),
+                    sub_dir
+                )
+
+                if not os.path.isdir(target_dir):
+                    continue
+
+                for name in os.listdir(target_dir):
+                    os.remove(
+                        os.path.join(target_dir, name)
+                    )
+
+                try:
+                    os.rmdir(target_dir)
+                except OSError:
+                    pass
 
             progress_finish("Master animation deleted.")
 
@@ -1672,47 +2661,27 @@ class CA_OT_render_screen_animation(bpy.types.Operator):
 
     def execute(self, context):
 
+        if job_running():
+
+            self.report(
+                {'WARNING'},
+                "A render job is already running."
+            )
+
+            return {'CANCELLED'}
+
         source = context.scene
         s = source.corner_anamorphic
 
+        window = context.window
+
+        original_scene = window.scene
         original_frame = source.frame_current
-        original_scene = context.window.scene
 
         try:
-
             update_rig(source)
 
-            frames_dir = os.path.join(
-                resolve_output_dir(s),
-                "master_frames"
-            )
-
-            load_master_sequence(
-                frames_dir,
-                source.frame_start,
-                source.frame_end
-            )
-
-            render_screen_feeds(source, context)
-
-            context.window.scene = original_scene
-            source.frame_set(original_frame)
-
-            progress_finish("Screen animation completed.")
-
-            self.report(
-                {'INFO'},
-                "Screen animation render completed."
-            )
-
-            return {'FINISHED'}
-
         except Exception as exc:
-
-            context.window.scene = original_scene
-            source.frame_set(original_frame)
-
-            progress_finish("Screen animation failed.")
 
             self.report(
                 {'ERROR'},
@@ -1720,6 +2689,40 @@ class CA_OT_render_screen_animation(bpy.types.Operator):
             )
 
             return {'CANCELLED'}
+
+        def step_load():
+            load_master_animation(source)
+
+        def step_finish():
+            window.scene = original_scene
+            source.frame_set(original_frame)
+            progress_finish(
+                "Screen animation render completed."
+            )
+
+        def cleanup():
+
+            try:
+                window.scene = original_scene
+            except Exception:
+                pass
+
+            source.frame_set(original_frame)
+
+        steps = [step_load]
+
+        steps += screen_feed_steps(source, s, window)
+
+        steps.append(step_finish)
+
+        start_job(steps, cleanup=cleanup)
+
+        self.report(
+            {'INFO'},
+            "Rendering screen animation..."
+        )
+
+        return {'FINISHED'}
 
 
 # ============================================================================
@@ -1767,9 +2770,9 @@ def set_view_camera(context, cam):
 
 def live_camera_update(self, context):
     """
-    FOV and focus offset apply directly to the existing
-    master camera; the UVProject modifiers follow the camera on
-    their own.
+    FOV, viewer angle and focus offset apply directly to the
+    existing master camera; the UVProject modifiers follow the
+    camera on their own.
     """
 
     try:
@@ -1783,12 +2786,60 @@ def live_camera_update(self, context):
             return
 
         configure_camera(cam, self)
-        look_at(cam, camera_focus_target(self))
+        place_camera(cam, self)
 
         update_scene_graph(scene)
 
     except Exception:
         pass
+
+
+def live_link_width_left(self, context):
+    if (
+        self.link_width
+        and self.right_width != self.left_width
+    ):
+        self.right_width = self.left_width
+
+
+def live_link_width_right(self, context):
+    if (
+        self.link_width
+        and self.left_width != self.right_width
+    ):
+        self.left_width = self.right_width
+
+
+def live_link_height_left(self, context):
+    if (
+        self.link_height
+        and self.right_height != self.left_height
+    ):
+        self.right_height = self.left_height
+
+
+def live_link_height_right(self, context):
+    if (
+        self.link_height
+        and self.left_height != self.right_height
+    ):
+        self.left_height = self.right_height
+
+
+def live_link_width_toggled(self, context):
+    if (
+        self.link_width
+        and self.right_width != self.left_width
+    ):
+        self.right_width = self.left_width
+
+
+def live_link_height_toggled(self, context):
+    if (
+        self.link_height
+        and self.right_height != self.left_height
+    ):
+        self.right_height = self.left_height
 
 
 def live_render_update(self, context):
@@ -1846,6 +2897,22 @@ class CA_Settings(bpy.types.PropertyGroup):
         unit='LENGTH'
     )
 
+    viewer_angle: bpy.props.FloatProperty(
+        name="Angle",
+        description=(
+            "Viewer position along the arc between the "
+            "two screens: 45 degrees is the centered "
+            "default, 0 degrees aligns with the right "
+            "screen's plane, 90 degrees with the left "
+            "screen's plane"
+        ),
+        default=math.radians(45.0),
+        min=0.0,
+        max=math.radians(90.0),
+        subtype='ANGLE',
+        update=live_camera_update
+    )
+
     fov: bpy.props.FloatProperty(
         name="FOV",
         description=(
@@ -1878,20 +2945,60 @@ class CA_Settings(bpy.types.PropertyGroup):
     # Screens
     # ------------------------------------------------------------------------
 
-    screen_width: bpy.props.FloatProperty(
-        name="Width",
+    left_width: bpy.props.FloatProperty(
+        name="Left Width",
         default=3.0,
         min=0.1,
         max=100.0,
-        unit='LENGTH'
+        unit='LENGTH',
+        update=live_link_width_left
     )
 
-    screen_height: bpy.props.FloatProperty(
-        name="Height",
+    right_width: bpy.props.FloatProperty(
+        name="Right Width",
+        default=3.0,
+        min=0.1,
+        max=100.0,
+        unit='LENGTH',
+        update=live_link_width_right
+    )
+
+    link_width: bpy.props.BoolProperty(
+        name="Link Width (X)",
+        description=(
+            "Keep both screens' widths identical - "
+            "editing either side updates the other"
+        ),
+        default=False,
+        update=live_link_width_toggled
+    )
+
+    left_height: bpy.props.FloatProperty(
+        name="Left Height",
         default=1.5,
         min=0.1,
         max=100.0,
-        unit='LENGTH'
+        unit='LENGTH',
+        update=live_link_height_left
+    )
+
+    right_height: bpy.props.FloatProperty(
+        name="Right Height",
+        default=1.5,
+        min=0.1,
+        max=100.0,
+        unit='LENGTH',
+        update=live_link_height_right
+    )
+
+    link_height: bpy.props.BoolProperty(
+        name="Link Height (Y)",
+        description=(
+            "Keep both screens' heights identical - "
+            "editing either side updates the other"
+        ),
+        default=True,
+        update=live_link_height_toggled
     )
 
     screen_z: bpy.props.FloatProperty(
@@ -1965,6 +3072,32 @@ class CA_Settings(bpy.types.PropertyGroup):
         update=live_render_update
     )
 
+    crop_master: bpy.props.BoolProperty(
+        name="Crop Master to Screen Area",
+        description=(
+            "Render only the rectangular region of "
+            "the master frame the screens project "
+            "onto (a render border fitted to the "
+            "screens). The output image keeps the "
+            "full master resolution, so the "
+            "projection is unaffected"
+        ),
+        default=True
+    )
+
+    crop_margin: bpy.props.IntProperty(
+        name="Crop Margin",
+        description=(
+            "Extra pixels rendered around the "
+            "screens' projected area when cropping "
+            "the master render"
+        ),
+        default=8,
+        min=0,
+        max=512,
+        subtype='PIXEL'
+    )
+
     render_percentage: bpy.props.IntProperty(
         name="Render %",
         default=100,
@@ -2001,7 +3134,7 @@ class CA_Settings(bpy.types.PropertyGroup):
         name="Mode",
         description=(
             "Write each screen feed as an image "
-            "sequence or as an MP4 video"
+            "sequence or as a video file"
         ),
         items=(
             (
@@ -2011,12 +3144,36 @@ class CA_Settings(bpy.types.PropertyGroup):
             ),
             (
                 'MP4',
-                "MP4 (H.264)",
+                "Video",
                 "Video file, requires a Blender "
                 "build with FFmpeg"
             )
         ),
         default='IMAGE'
+    )
+
+    video_format: bpy.props.EnumProperty(
+        name="Format",
+        description=(
+            "Container format for video output "
+            "(codec is chosen to match)"
+        ),
+        items=(
+            ('MPEG4', "MP4", "MPEG-4 container, H.264"),
+            ('MKV', "Matroska", "MKV container, H.264"),
+            (
+                'QUICKTIME',
+                "QuickTime",
+                "MOV container, H.264"
+            ),
+            ('AVI', "AVI", "AVI container, H.264"),
+            ('WEBM', "WebM", "WebM container, VP9"),
+            ('MPEG1', "MPEG-1", ""),
+            ('MPEG2', "MPEG-2", ""),
+            ('OGG', "Ogg", "Ogg container, Theora"),
+            ('DV', "DV", "DV container, DV video")
+        ),
+        default='MPEG4'
     )
 
     image_format: bpy.props.EnumProperty(
@@ -2081,7 +3238,7 @@ class CA_Settings(bpy.types.PropertyGroup):
     )
 
     combined_filename: bpy.props.StringProperty(
-        name="Combined Filename",
+        name="Filename",
         description=(
             "Output name for the combined wide "
             "render (extension is added automatically)"
@@ -2136,6 +3293,7 @@ class CA_PT_main(bpy.types.Panel):
         col = box.column(align=True)
         col.prop(s, "viewer_distance")
         col.prop(s, "eye_height")
+        col.prop(s, "viewer_angle")
         col.prop(s, "fov")
         col.prop(s, "focus_offset")
 
@@ -2147,8 +3305,37 @@ class CA_PT_main(bpy.types.Panel):
         box.label(text="Screens", icon='IMAGE_DATA')
 
         col = box.column(align=True)
-        col.prop(s, "screen_width")
-        col.prop(s, "screen_height")
+
+        row = col.row(align=True)
+        row.prop(s, "left_width", text="Width L")
+        row.prop(
+            s,
+            "link_width",
+            text="",
+            icon=(
+                'LINKED'
+                if s.link_width
+                else 'UNLINKED'
+            ),
+            toggle=True
+        )
+        row.prop(s, "right_width", text="R")
+
+        row = col.row(align=True)
+        row.prop(s, "left_height", text="Height L")
+        row.prop(
+            s,
+            "link_height",
+            text="",
+            icon=(
+                'LINKED'
+                if s.link_height
+                else 'UNLINKED'
+            ),
+            toggle=True
+        )
+        row.prop(s, "right_height", text="R")
+
         col.prop(s, "screen_z")
         col.prop(s, "corner_angle")
         col.prop(s, "screen_subdivisions")
@@ -2163,24 +3350,57 @@ class CA_PT_main(bpy.types.Panel):
         col = box.column(align=True)
         col.prop(s, "resolution_multiplier")
 
-        res_x = max(
-            4,
-            int(round(
-                s.screen_width
-                * s.resolution_multiplier
-            ))
-        )
-        res_y = max(
-            4,
-            int(round(
-                s.screen_height
-                * s.resolution_multiplier
-            ))
-        )
+        def output_res(width, height):
+            return (
+                max(
+                    4,
+                    int(round(
+                        width
+                        * s.resolution_multiplier
+                    ))
+                ),
+                max(
+                    4,
+                    int(round(
+                        height
+                        * s.resolution_multiplier
+                    ))
+                )
+            )
 
-        col.label(
-            text=f"Screen Output: {res_x} x {res_y} px"
-        )
+        if s.render_layout == 'COMBINED':
+
+            res_x, res_y = output_res(
+                s.left_width + s.right_width,
+                max(s.left_height, s.right_height)
+            )
+
+            col.label(
+                text=(
+                    f"Combined Output: "
+                    f"{res_x} x {res_y} px"
+                )
+            )
+
+        else:
+
+            res_x, res_y = output_res(
+                s.left_width,
+                s.left_height
+            )
+
+            col.label(
+                text=f"Left Output: {res_x} x {res_y} px"
+            )
+
+            res_x, res_y = output_res(
+                s.right_width,
+                s.right_height
+            )
+
+            col.label(
+                text=f"Right Output: {res_x} x {res_y} px"
+            )
 
         row = col.row(align=True)
         row.prop(s, "master_resolution_x")
@@ -2189,6 +3409,11 @@ class CA_PT_main(bpy.types.Panel):
         row = col.row(align=True)
         row.prop(s, "fps")
         row.prop(s, "render_percentage")
+
+        col.prop(s, "crop_master")
+
+        if s.crop_master:
+            col.prop(s, "crop_margin")
 
         col.prop(s, "transparent_film")
 
@@ -2203,10 +3428,6 @@ class CA_PT_main(bpy.types.Panel):
         col.operator(
             "corner_anamorphic.build_rig",
             icon='FILE_REFRESH'
-        )
-        col.operator(
-            "corner_anamorphic.update_rig",
-            icon='CHECKMARK'
         )
 
         row = col.row(align=True)
@@ -2234,6 +3455,8 @@ class CA_PT_main(bpy.types.Panel):
 
         if s.output_mode == 'IMAGE':
             col.prop(s, "image_format")
+        else:
+            col.prop(s, "video_format")
 
         col.separator()
 
@@ -2243,7 +3466,25 @@ class CA_PT_main(bpy.types.Panel):
 
         col.separator()
 
-        col.prop(s, "output_directory")
+        try:
+            display_dir = bpy.path.abspath(
+                s.output_directory
+            )
+        except Exception:
+            display_dir = s.output_directory
+
+        row = col.row(align=True)
+        row.operator(
+            "corner_anamorphic.change_output_directory",
+            text="",
+            icon='EXPORT'
+        )
+        row.operator(
+            "corner_anamorphic.open_output_directory",
+            text="",
+            icon='FILE_FOLDER'
+        )
+        row.label(text=display_dir)
 
         if s.render_layout == 'COMBINED':
 
@@ -2251,9 +3492,8 @@ class CA_PT_main(bpy.types.Panel):
 
         else:
 
-            row = col.row(align=True)
-            row.prop(s, "left_filename")
-            row.prop(s, "right_filename")
+            col.prop(s, "left_filename")
+            col.prop(s, "right_filename")
 
         col.separator()
 
@@ -2275,9 +3515,15 @@ class CA_PT_main(bpy.types.Panel):
             icon='TRASH'
         )
 
-        col.operator(
+        row = col.row(align=True)
+        row.operator(
             "corner_anamorphic.render_screen_animation",
             icon='RENDER_STILL'
+        )
+        row.operator(
+            "corner_anamorphic.open_render_directory",
+            text="",
+            icon='FILE_FOLDER'
         )
 
         # --------------------------------------------------------------------
@@ -2291,7 +3537,11 @@ class CA_PT_main(bpy.types.Panel):
             total = max(1, CA_PROGRESS["total"])
             done = CA_PROGRESS["done"]
             current = min(done + 1, total)
-            fraction = done / total
+
+            fraction = frame_progress_fraction()
+
+            if fraction is None:
+                fraction = done / total
 
             col.label(
                 text=(
@@ -2335,7 +3585,10 @@ classes = (
     CA_Settings,
 
     CA_OT_build_rig,
-    CA_OT_update,
+    CA_OT_ffmpeg_warning,
+    CA_OT_change_output_directory,
+    CA_OT_open_output_directory,
+    CA_OT_open_render_directory,
     CA_OT_delete_rig,
     CA_OT_frame_master,
 
@@ -2362,6 +3615,16 @@ def register():
     for handler_list, fn in CA_PROGRESS_HANDLERS:
         if fn not in handler_list:
             handler_list.append(fn)
+
+    # Warn once per session when MP4 output can never work (the
+    # Microsoft Store build has no FFmpeg).  bpy.data is restricted
+    # while the add-on is being enabled, so the check itself runs
+    # inside the deferred timer callback, not here.
+    if not bpy.app.background:
+        bpy.app.timers.register(
+            show_ffmpeg_warning_popup,
+            first_interval=1.0
+        )
 
 
 def unregister():
